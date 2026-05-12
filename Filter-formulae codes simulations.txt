@@ -63,46 +63,121 @@ plt.legend()
 plt.grid(True)
 plt.show()
 
-B.	Code for EKF
+
+# Code for EKF
+import numpy as np
+import matplotlib.pyplot as plt
 import math
-# 1. SETUP (Same Scenario)
-ekf_path_x, ekf_path_y = [], []
-x_ekf = np.array([[0.1], [300], [0.1], [0]]) # Avoid 0 division
+
+# SAME SCENARIO (Truth + Noise)
+
+dt = 0.1
+t = np.arange(0, 100, dt)
+n = len(t)
+
+x_true, y_true = np.zeros(n), np.zeros(n)
+vx, vy = 300, 0
+
+for i in range(1, n):
+    if t[i] < 50:   # Straight motion
+        x_true[i] = x_true[i-1] + vx * dt
+        y_true[i] = y_true[i-1] + vy * dt
+    else:           # Turn
+        vx = vx - (0.15 * vy) * dt - (0.5 * vx * dt)
+        vy = vy + (0.15 * vx) * dt
+        x_true[i] = x_true[i-1] + vx * dt
+        y_true[i] = y_true[i-1] + vy * dt
+
+noise_level = 50
+z_x = x_true + np.random.normal(0, noise_level, n)
+z_y = y_true + np.random.normal(0, noise_level, n)
+
+# EKF SETUP
+# State = [x, y, vx, vy]
+x_ekf = np.array([[z_x[0]],
+                  [z_y[0]],
+                  [300.0],
+                  [0.0]])
+
+F = np.array([[1, 0, dt, 0],
+              [0, 1, 0, dt],
+              [0, 0, 1, 0],
+              [0, 0, 0, 1]])
+
 P = np.eye(4) * 1000
-R = np.array([[noise_level**2, 0], [0, 0.01**2]]) # Range/Bearing noise
-# 2. EKF LOOP
+Q = np.eye(4) * 0.1
+R = np.array([[noise_level**2, 0],
+              [0, 0.01**2]])   # range, bearing noise
+
+ekf_path_x, ekf_path_y = [], []
+
+def h(x):
+    px, py, vx, vy = x.flatten()
+    r = math.sqrt(px**2 + py**2)
+    if r < 1e-6:
+        r = 1e-6
+    b = math.atan2(py, px)
+    return np.array([[r],
+                     [b]])
+
+def jacobian_H(x):
+    px, py, vx, vy = x.flatten()
+    r2 = px**2 + py**2
+    if r2 < 1e-6:
+        r2 = 1e-6
+    r = math.sqrt(r2)
+
+    Hj = np.array([
+        [px/r,      py/r,      0, 0],
+        [-py/r2,    px/r2,     0, 0]
+    ])
+    return Hj
+
+def normalize_angle(angle):
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+# EKF LOOP
+
 for i in range(n):
-    # Here, the noisy x and y radar measurements are converted into range and bearing, because EKF works with a nonlinear radar measurement model.
-    r = math.sqrt(z_x[i]**2 + z_y[i]**2)
-    b = math.atan2(z_y[i], z_x[i])
-    z = np.array([[r], [b]])
-    # The filter predicts the next aircraft state and also predicts the uncertainty in that estimate.
+    # Noisy radar measurement in range-bearing form
+    r_meas = math.sqrt(z_x[i]**2 + z_y[i]**2)
+    b_meas = math.atan2(z_y[i], z_x[i])
+    z = np.array([[r_meas],
+                  [b_meas]])
+
+    # Predict
     x_pred = F @ x_ekf
     P_pred = F @ P @ F.T + Q
-#Since the radar measurement equation is nonlinear, EKF cannot use it directly like LKF. So it computes the Jacobian matrix Hj, which is a linear approximation of the nonlinear measurement model around the predicted state.
-    px, py = x_pred[0, 0], x_pred[1, 0]
-    d = math.sqrt(px**2 + py**2)
-    if d < 0.001: d = 0.001
-    Hj = np.array([[px/d, 0, py/d, 0], [-py/(d**2), 0, px/(d**2), 0]])
-    # This computes the predicted measurement and then finds the residual (error) between the actual radar measurement and the predicted one.
-    z_pred = np.array([[d], [math.atan2(py, px)]])
+
+    # Linearize measurement model
+    Hj = jacobian_H(x_pred)
+
+    # Predicted measurement
+    z_pred = h(x_pred)
+
+    # Innovation
     y_res = z - z_pred
-#This keeps the bearing angle error within the valid range of -π to +π, so angle wrapping does not create a false large error.
-    while y_res[1, 0] > math.pi: y_res[1, 0] -= 2*math.pi
-    while y_res[1, 0] < -math.pi: y_res[1, 0] += 2*math.pi
-This calculates S: uncertainty in the measurement space. K: the Kalman gain, which decides how much the filter should trust the prediction and how much it should trust the radar measurement.
+    y_res[1, 0] = normalize_angle(y_res[1, 0])
+
+    # Update
     S = Hj @ P_pred @ Hj.T + R
     K = P_pred @ Hj.T @ np.linalg.inv(S)
-#updating the predicted state and uncertainty using the new measurement.
+
     x_ekf = x_pred + K @ y_res
     P = (np.eye(4) - K @ Hj) @ P_pred
+
     ekf_path_x.append(x_ekf[0, 0])
-    ekf_path_y.append(x_ekf[2, 0])
-# 3. PLOT
+    ekf_path_y.append(x_ekf[1, 0])
+
+# PLOT
 plt.figure(figsize=(10, 6))
 plt.plot(x_true, y_true, 'g-', linewidth=3, label='True Path')
 plt.plot(ekf_path_x, ekf_path_y, 'm-', linewidth=2, label='EKF (Extended)')
-plt.title('2. Extended Kalman Filter (EKF): Drift & Singularity')
+plt.title('Extended Kalman Filter (EKF) Tracking')
 plt.legend()
 plt.grid(True)
 plt.show()
