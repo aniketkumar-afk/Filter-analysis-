@@ -1,0 +1,204 @@
+Codes for LKF, EKF,UKF and IIM-UKF:
+
+
+I.	CODE FOR THE PLOTTING THE FILTERS
+A.	Code for LKF
+import numpy as np
+import matplotlib.pyplot as plt
+# 1. SCENARIO (Truth + Noise)
+dt = 0.1
+t = np.arange(0, 100, dt)
+n = len(t)
+x_true, y_true = np.zeros(n), np.zeros(n)
+vx, vy = 300, 0
+# This means the simulation advances every 0.1 s, it runs for 100 s, the aircraft starts at the origin, and its initial speed is 300 m/s along x.
+for i in range(1, n):
+    if t[i] < 50: 
+        x_true[i] = x_true[i-1] + vx * dt
+        y_true[i] = y_true[i-1] + vy * dt
+ # For the first 50 s, the aircraft flies straight. After 50 s, the code changes the velocity values so the target starts turning.
+    else: 
+# this means the aircraft is no longer flying straight. It has started a maneuver.
+        vx = vx - (0.15 * vy) * dt - (0.5 * vx * dt)
+# the velocity in the x-direction is changed. This simulates the aircraft beginning to turn, so its forward motion changes instead of staying constant.
+        vy = vy + (0.15 * vx) * dt
+# the velocity in the y-direction increases, which bends the path upward or sideways and creates a curved motion.
+        x_true[i] = x_true[i-1] + vx * dt
+        y_true[i] = y_true[i-1] + vy * dt
+# the new x and y positions are calculated from the updated values.
+noise_level = 50
+#setting up noise level
+z_x = x_true + np.random.normal(0, noise_level, n)
+z_y = y_true + np.random.normal(0, noise_level, n)
+#this creates the measured x-position, y-position by adding random noise to the true x-position and y-position.
+# 2. LKF SETUP
+x_lkf = np.zeros((4, 1)) # State or column vector  [x, y, vx, vy]
+F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]]) 
+# It tells the filter how the aircraft is expected to move from one time step to the next. E.g. [1, 0, dt, 0]  x_new = x_old*1 +0+ vx * dt + vy*0.
+H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]]) # Measurement matrix, it tells the filter what the radar actually measures. In this case, the radar measurements are only x and y position, not velocity.
+P = np.eye(4) * 1000
+R = np.eye(2) * noise_level**2
+Q = np.eye(4) * 0.1
+# P, R, and Q define the uncertainty in the Kalman filter: P for the initial state, R for measurement noise, and Q for model/process uncertainty. Without them, the filter cannot properly balance prediction and measurement, which can cause inaccurate tracking, noise-following, or even loss of track.
+lkf_path_x, lkf_path_y = [], []
+# 3. LKF LOOP
+for i in range(n):
+    z = np.array([[z_x[i]], [z_y[i]]])
+    # Predict
+    x_pred = F @ x_lkf
+    P_pred = F @ P @ F.T + Q
+    # Update
+    K = P_pred @ H.T @ np.linalg.inv(H @ P_pred @ H.T +   R)
+    x_lkf = x_pred + K @ (z - H @ x_pred)
+    P = (np.eye(4) - K @ H) @ P_pred
+    lkf_path_x.append(x_lkf[0, 0])
+    lkf_path_y.append(x_lkf[1, 0])
+#Above loop shows the standard prediction & update structure of LKF. It works well when the aircraft motion is close to the assumed linear constant-velocity model, but for a fighter aircraft making sudden turns, the prediction model becomes weak, so the LKF path starts deviating from the true path.
+# 4. PLOT
+plt.figure(figsize=(10, 6))
+plt.plot(x_true, y_true, 'g-', linewidth=3, label='True Path')
+plt.plot(lkf_path_x, lkf_path_y, 'b--', linewidth=2, label='LKF (Linear)')
+plt.title('1. Linear Kalman Filter (LKF): Failure at Turn')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+B.	Code for EKF
+import math
+# 1. SETUP (Same Scenario)
+ekf_path_x, ekf_path_y = [], []
+x_ekf = np.array([[0.1], [300], [0.1], [0]]) # Avoid 0 division
+P = np.eye(4) * 1000
+R = np.array([[noise_level**2, 0], [0, 0.01**2]]) # Range/Bearing noise
+# 2. EKF LOOP
+for i in range(n):
+    # Here, the noisy x and y radar measurements are converted into range and bearing, because EKF works with a nonlinear radar measurement model.
+    r = math.sqrt(z_x[i]**2 + z_y[i]**2)
+    b = math.atan2(z_y[i], z_x[i])
+    z = np.array([[r], [b]])
+    # The filter predicts the next aircraft state and also predicts the uncertainty in that estimate.
+    x_pred = F @ x_ekf
+    P_pred = F @ P @ F.T + Q
+#Since the radar measurement equation is nonlinear, EKF cannot use it directly like LKF. So it computes the Jacobian matrix Hj, which is a linear approximation of the nonlinear measurement model around the predicted state.
+    px, py = x_pred[0, 0], x_pred[1, 0]
+    d = math.sqrt(px**2 + py**2)
+    if d < 0.001: d = 0.001
+    Hj = np.array([[px/d, 0, py/d, 0], [-py/(d**2), 0, px/(d**2), 0]])
+    # This computes the predicted measurement and then finds the residual (error) between the actual radar measurement and the predicted one.
+    z_pred = np.array([[d], [math.atan2(py, px)]])
+    y_res = z - z_pred
+#This keeps the bearing angle error within the valid range of -π to +π, so angle wrapping does not create a false large error.
+    while y_res[1, 0] > math.pi: y_res[1, 0] -= 2*math.pi
+    while y_res[1, 0] < -math.pi: y_res[1, 0] += 2*math.pi
+This calculates S: uncertainty in the measurement space. K: the Kalman gain, which decides how much the filter should trust the prediction and how much it should trust the radar measurement.
+    S = Hj @ P_pred @ Hj.T + R
+    K = P_pred @ Hj.T @ np.linalg.inv(S)
+#updating the predicted state and uncertainty using the new measurement.
+    x_ekf = x_pred + K @ y_res
+    P = (np.eye(4) - K @ Hj) @ P_pred
+    ekf_path_x.append(x_ekf[0, 0])
+    ekf_path_y.append(x_ekf[2, 0])
+# 3. PLOT
+plt.figure(figsize=(10, 6))
+plt.plot(x_true, y_true, 'g-', linewidth=3, label='True Path')
+plt.plot(ekf_path_x, ekf_path_y, 'm-', linewidth=2, label='EKF (Extended)')
+plt.title('2. Extended Kalman Filter (EKF): Drift & Singularity')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+C.	Code for UKF
+import numpy as np
+import matplotlib.pyplot as plt
+!pip install filterpy
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
+def fx(x, dt):
+    # This tells the UKF how the aircraft state changes with time. It assumes constant velocity, so position updates with velocity.
+    px, vx, py, vy = x
+    return np.array([px + vx*dt, vx,
+                     py + vy*dt, vy])
+# This converts the state into radar measurements: range and bearing. Since radar observations are nonlinear, this is where UKF becomes useful.
+def hx(x):
+    px, vx, py, vy = x
+    r = np.sqrt(px**2 + py**2)
+    b = np.arctan2(py, px)
+    return np.array([r, b])
+# These functions calculate the difference between values.
+residual_z is important because it correctly handles angle wrapping in bearing.
+def residual_z(a, b):
+    y = a - b
+    y[1] = (y[1] + np.pi) % (2*np.pi) - np.pi
+    return y
+def residual_x(a, b):
+    return a - b
+# This creates the sigma points, which are sample points used by UKF to pass the state through nonlinear equations.
+points = MerweScaledSigmaPoints(n=4, alpha=0.1, beta=2.0, kappa=0.0)
+ukf = UKF(dim_x=4, dim_z=2, dt=dt, fx=fx, hx=hx, points=points,
+          residual_z=residual_z, residual_x=residual_x)
+ukf.x = np.array([0., 300., 0., 0.])
+ukf.P = np.eye(4) * 10.0
+ukf.R = np.diag([noise_level**2, 0.01**2])
+ukf.Q = np.eye(4) * 0.1
+ukf_path_x, ukf_path_y = [], []
+for i in range(n):
+    r = np.sqrt(z_x[i]**2 + z_y[i]**2)
+    b = np.arctan2(z_y[i], z_x[i])
+    ukf.predict()
+    ukf.update(np.array([r, b]))
+    ukf_path_x.append(ukf.x[0])
+    ukf_path_y.append(ukf.x[2])
+# The UKF code tracks the fighter aircraft using a nonlinear radar measurement model based on range and bearing. Instead of linearizing the system like EKF, it uses sigma points to better capture nonlinear motion and measurement behavior. This makes UKF more accurate and stable than EKF for maneuvering target tracking, though it still uses only a single motion model.
+plt.figure(figsize=(10, 6))
+plt.plot(x_true, y_true, 'g-', linewidth=3, label='True Path')
+plt.plot(ukf_path_x, ukf_path_y, 'k--', linewidth=2, label='UKF (Unscented)')
+plt.title('Unscented Kalman Filter (UKF)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+D.	Code for IMM-UKF
+from filterpy.kalman import IMMEstimator
+# 1. SETUP TWO FILTERS
+# Filter 1: Straight Line Model (Low Q)
+ukf1 = UKF(dim_x=4, dim_z=2, dt=dt, fx=fx, hx=hx, points=points)
+ukf1.x = np.array([0., 300., 0., 0.])
+ukf1.R = np.diag([noise_level**2, 0.01**2])
+ukf1.Q = np.eye(4) * 0.1
+# Filter 2: Maneuvering Model (High Q - Expects Turns)
+ukf2 = UKF(dim_x=4, dim_z=2, dt=dt, fx=fx, hx=hx, points=points)
+ukf2.x = np.array([0., 300., 0., 0.])
+ukf2.R = np.diag([noise_level**2, 0.01**2])
+ukf2.Q = np.eye(4) * 100.0 # High Uncertainty
+# 2. SETUP IMM
+filters = [ukf1, ukf2]
+mu = np.array([0.9, 0.1]) # Start assuming straight
+M = np.array([[0.95, 0.05], [0.05, 0.95]]) # Switching probability
+imm = IMMEstimator(filters, mu, M)
+imm_path_x, imm_path_y, probs = [], [], []
+# 3. IMM LOOP
+for i in range(n):
+    r = np.sqrt(z_x[i]**2 + z_y[i]**2)
+    b = np.arctan2(z_y[i], z_x[i])
+    z = np.array([r, b])
+    imm.predict()
+    imm.update(z)
+    imm_path_x.append(imm.x[0])
+    imm_path_y.append(imm.x[2])
+    probs.append(imm.mu[1]) # Probability of Turning
+# 4. PLOT TRAJECTORY
+plt.figure(figsize=(10, 6))
+plt.plot(x_true, y_true, 'g-', linewidth=4, alpha=0.3, label='True Path')
+plt.plot(imm_path_x, imm_path_y, 'b-', linewidth=2, label='IMM-UKF (Result)')
+plt.title('4. IMM-UKF: Best Tracking Performance')
+plt.legend()
+plt.grid(True)
+plt.show()
+# 5. PLOT PROBABILITY
+plt.figure(figsize=(10, 3))
+plt.plot(t, probs, 'k-', linewidth=2)
+plt.title('IMM Mode Probability (Turn Detection)')
+plt.ylabel('Prob of Turn')
+plt.xlabel('Time (s)')
+plt.grid(True)
+plt.show()
