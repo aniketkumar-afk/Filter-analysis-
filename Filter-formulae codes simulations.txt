@@ -277,3 +277,267 @@ plt.ylabel('Prob of Turn')
 plt.xlabel('Time (s)')
 plt.grid(True)
 plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+# If needed:
+# !pip install filterpy
+!pip install filterpy
+
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
+from filterpy.kalman import IMMEstimator
+
+np.random.seed(7)
+
+
+# 1. SCENARIO: Truth trajectory + same noisy measurements
+
+dt = 0.1
+t = np.arange(0, 100, dt)
+n = len(t)
+
+x_true, y_true = np.zeros(n), np.zeros(n)
+vx, vy = 300.0, 0.0
+
+for i in range(1, n):
+    if t[i] < 50:   # Straight flight
+        x_true[i] = x_true[i-1] + vx * dt
+        y_true[i] = y_true[i-1] + vy * dt
+    else:           # Turn / maneuver
+        vx = vx - (0.15 * vy) * dt - (0.5 * vx * dt)
+        vy = vy + (0.15 * vx) * dt
+        x_true[i] = x_true[i-1] + vx * dt
+        y_true[i] = y_true[i-1] + vy * dt
+
+# Same noise for all filters
+noise_level = 50
+z_x = x_true + np.random.normal(0, noise_level, n)
+z_y = y_true + np.random.normal(0, noise_level, n)
+
+# Radar-domain measurements for EKF/UKF/IMM-UKF
+z_r = np.sqrt(z_x**2 + z_y**2)
+z_b = np.arctan2(z_y, z_x)
+
+
+# 2. LKF
+# State = [x, y, vx, vy]
+
+x_lkf = np.zeros((4, 1))
+
+F = np.array([
+    [1, 0, dt, 0],
+    [0, 1, 0, dt],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1]
+])
+
+H = np.array([
+    [1, 0, 0, 0],
+    [0, 1, 0, 0]
+])
+
+P_lkf = np.eye(4) * 1000
+R_lkf = np.eye(2) * noise_level**2
+Q_lkf = np.eye(4) * 0.1
+
+lkf_path_x, lkf_path_y = [], []
+
+for i in range(n):
+    z = np.array([[z_x[i]], [z_y[i]]])
+
+    # Predict
+    x_pred = F @ x_lkf
+    P_pred = F @ P_lkf @ F.T + Q_lkf
+
+    # Update
+    K = P_pred @ H.T @ np.linalg.inv(H @ P_pred @ H.T + R_lkf)
+    x_lkf = x_pred + K @ (z - H @ x_pred)
+    P_lkf = (np.eye(4) - K @ H) @ P_pred
+
+    lkf_path_x.append(x_lkf[0, 0])
+    lkf_path_y.append(x_lkf[1, 0])
+
+
+# 3. EKF
+# State = [x, y, vx, vy]
+
+x_ekf = np.array([[z_x[0]],
+                  [z_y[0]],
+                  [300.0],
+                  [0.0]])
+
+P_ekf = np.eye(4) * 1000
+Q_ekf = np.eye(4) * 0.1
+R_ekf = np.array([
+    [noise_level**2, 0],
+    [0, 0.01**2]
+])
+
+ekf_path_x, ekf_path_y = [], []
+
+def h_ekf(x):
+    px, py, vx, vy = x.flatten()
+    r = math.sqrt(px**2 + py**2)
+    if r < 1e-6:
+        r = 1e-6
+    b = math.atan2(py, px)
+    return np.array([[r], [b]])
+
+def jacobian_H(x):
+    px, py, vx, vy = x.flatten()
+    r2 = px**2 + py**2
+    if r2 < 1e-6:
+        r2 = 1e-6
+    r = math.sqrt(r2)
+
+    return np.array([
+        [px/r,    py/r,    0, 0],
+        [-py/r2,  px/r2,   0, 0]
+    ])
+
+def normalize_angle(angle):
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+for i in range(n):
+    z = np.array([[z_r[i]], [z_b[i]]])
+
+    # Predict
+    x_pred = F @ x_ekf
+    P_pred = F @ P_ekf @ F.T + Q_ekf
+
+    # Linearization
+    Hj = jacobian_H(x_pred)
+    z_pred = h_ekf(x_pred)
+
+    # Innovation
+    y_res = z - z_pred
+    y_res[1, 0] = normalize_angle(y_res[1, 0])
+
+    # Update
+    S = Hj @ P_pred @ Hj.T + R_ekf
+    K = P_pred @ Hj.T @ np.linalg.inv(S)
+    x_ekf = x_pred + K @ y_res
+    P_ekf = (np.eye(4) - K @ Hj) @ P_pred
+
+    ekf_path_x.append(x_ekf[0, 0])
+    ekf_path_y.append(x_ekf[1, 0])
+
+
+# 4. UKF
+# State = [x, vx, y, vy]  (filterpy-friendly layout)
+
+def fx_ukf(x, dt):
+    px, vx, py, vy = x
+    return np.array([px + vx*dt, vx, py + vy*dt, vy])
+
+def hx_ukf(x):
+    px, vx, py, vy = x
+    r = np.sqrt(px**2 + py**2)
+    if r < 1e-6:
+        r = 1e-6
+    b = np.arctan2(py, px)
+    return np.array([r, b])
+
+def residual_z(a, b):
+    y = a - b
+    y[1] = (y[1] + np.pi) % (2*np.pi) - np.pi
+    return y
+
+def residual_x(a, b):
+    return a - b
+
+points = MerweScaledSigmaPoints(n=4, alpha=0.1, beta=2.0, kappa=0.0)
+
+ukf = UKF(
+    dim_x=4, dim_z=2, dt=dt,
+    fx=fx_ukf, hx=hx_ukf,
+    points=points,
+    residual_z=residual_z,
+    residual_x=residual_x
+)
+
+ukf.x = np.array([0.0, 300.0, 0.0, 0.0])
+ukf.P = np.eye(4) * 10.0
+ukf.R = np.diag([noise_level**2, 0.01**2])
+ukf.Q = np.eye(4) * 0.1
+
+ukf_path_x, ukf_path_y = [], []
+
+for i in range(n):
+    z = np.array([z_r[i], z_b[i]])
+    ukf.predict()
+    ukf.update(z)
+    ukf_path_x.append(ukf.x[0])
+    ukf_path_y.append(ukf.x[2])
+
+
+# 5. IMM-UKF
+
+ukf1 = UKF(
+    dim_x=4, dim_z=2, dt=dt,
+    fx=fx_ukf, hx=hx_ukf,
+    points=points,
+    residual_z=residual_z,
+    residual_x=residual_x
+)
+ukf1.x = np.array([0.0, 300.0, 0.0, 0.0])
+ukf1.P = np.eye(4) * 10.0
+ukf1.R = np.diag([noise_level**2, 0.01**2])
+ukf1.Q = np.eye(4) * 0.1   # straight-motion model
+
+ukf2 = UKF(
+    dim_x=4, dim_z=2, dt=dt,
+    fx=fx_ukf, hx=hx_ukf,
+    points=points,
+    residual_z=residual_z,
+    residual_x=residual_x
+)
+ukf2.x = np.array([0.0, 300.0, 0.0, 0.0])
+ukf2.P = np.eye(4) * 10.0
+ukf2.R = np.diag([noise_level**2, 0.01**2])
+ukf2.Q = np.eye(4) * 100.0  # maneuvering model
+
+filters = [ukf1, ukf2]
+mu = np.array([0.9, 0.1])
+M = np.array([
+    [0.95, 0.05],
+    [0.05, 0.95]
+])
+
+imm = IMMEstimator(filters, mu, M)
+
+imm_path_x, imm_path_y, probs = [], [], []
+
+for i in range(n):
+    z = np.array([z_r[i], z_b[i]])
+    imm.predict()
+    imm.update(z)
+
+    imm_path_x.append(imm.x[0])
+    imm_path_y.append(imm.x[2])
+    probs.append(imm.mu[1])
+
+# 6. COMBINED PLOT
+
+plt.figure(figsize=(12, 7))
+
+plt.plot(x_true, y_true, 'g-', linewidth=3, label='True Path')
+plt.plot(lkf_path_x, lkf_path_y, 'b--', linewidth=2, label='LKF')
+plt.plot(ekf_path_x, ekf_path_y, 'm-', linewidth=2, label='EKF')
+plt.plot(ukf_path_x, ukf_path_y, 'k-.', linewidth=2, label='UKF')
+plt.plot(imm_path_x, imm_path_y, 'r-', linewidth=2.5, label='IMM-UKF')
+
+plt.title('Comparative Tracking Performance of LKF, EKF, UKF, and IMM-UKF')
+plt.xlabel('X Position')
+plt.ylabel('Y Position')
+plt.legend()
+plt.grid(True)
+plt.show()
